@@ -38,7 +38,7 @@ function baseSnapshot() {
       buildSchema(text);
       return text;
     } catch {
-      // Local checkouts may not have a base ref or base snapshot may not parse.
+      // Local checkouts may not have a base ref or candidate ref may be invalid.
       // Falling back to the committed snapshot still catches uncommitted schema drift.
     }
   }

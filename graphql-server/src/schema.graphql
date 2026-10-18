@@ -65,6 +65,8 @@ type Query {
     from: String
     to: String
     sourceAccount: String
+    """Opt-in request for total matching count."""
+    includeTotalCount: Boolean = false
   ): TransactionPage!
 
   """
@@ -204,8 +206,8 @@ type Query {
     limit: Int = 20
     """Opaque cursor from a previous page's `pageInfo`; see `PageInfo`."""
     cursor: String
-    """Traversal direction from cursor; defaults to FORWARD."""
-    direction: PaginationDirection = FORWARD
+    """Opt-in request for total matching count."""
+    includeTotalCount: Boolean = false
   ): AccountPage!
 
   """
@@ -238,6 +240,8 @@ type Query {
     """Traversal direction from cursor; defaults to FORWARD."""
     direction: PaginationDirection = FORWARD
     order: LedgerOrder = DESC
+    """Opt-in request for total matching count."""
+    includeTotalCount: Boolean = false
   ): OperationPage!
 
   """
@@ -346,8 +350,8 @@ type Query {
     limit: Int = 20
     """Opaque cursor from a previous page's `pageInfo`; see `PageInfo`."""
     cursor: String
-    """Traversal direction from cursor; defaults to FORWARD."""
-    direction: PaginationDirection = FORWARD
+    """Opt-in request for total matching count."""
+    includeTotalCount: Boolean = false
   ): LedgerPage!
 
   """
@@ -448,6 +452,27 @@ type Query {
     """Network to read; defaults to the primary network configured for this deployment."""
     network: Network
   ): IndexerStatus!
+
+  """
+  Query executed trades, populated from Horizon's /trades endpoint.
+  Optionally filtered by asset pair and by account.
+  """
+  trades(
+    """Network to read; defaults to the primary network configured for this deployment."""
+    network: Network
+    """Filter by base asset."""
+    baseAsset: TradeAssetInput
+    """Filter by counter asset."""
+    counterAsset: TradeAssetInput
+    """Filter by account address (matches base or counter account)."""
+    account: String
+    """Maximum page size is 100. Larger limits are rejected."""
+    limit: Int = 20
+    """Opaque cursor from a previous page's `pageInfo`; see `PageInfo`."""
+    cursor: String
+    """Opt-in request for total matching count."""
+    includeTotalCount: Boolean = false
+  ): TradePage!
 }
 
 """
@@ -598,6 +623,33 @@ type PageInfo {
   unchanged as the `cursor` argument.
   """
   cursor: String
+  """
+  Total count of matching records where affordable, or an estimate labelled as such.
+  Opt-in via includeTotalCount or field selection.
+  """
+  totalCount: TotalCount
+}
+
+"""
+Precision of a reported count.
+"""
+enum CountPrecision {
+  """Exact count derived from a table scan or index."""
+  EXACT
+  """Estimated count from Postgres statistics (pg_class reltuples) for expensive scans."""
+  ESTIMATE
+}
+
+"""
+Total count of matching records and its precision.
+"""
+type TotalCount {
+  """The total count value, exact or estimated."""
+  value: Int!
+  """Whether the count is an exact scan/index count or an estimate."""
+  precision: CountPrecision!
+  """Convenience boolean: true when precision is ESTIMATE."""
+  isEstimate: Boolean!
 }
 
 """A page of transactions, in the order its query returns them."""
@@ -1265,113 +1317,49 @@ type BalanceSnapshot {
   operationId: String!
 }
 
+# ─── Trades ───────────────────────────────────────────────────────────────────
 
-"""Asset analytics statistics (Issue #7)."""
-type AssetStats {
-  code: String!
-  issuer: String!
-  holderCount: Int!
-  circulatingSupply: String
-  volume24h: String
-  firstSeenLedger: Int!
-  lastActivityLedger: Int!
+"""
+Asset input filter for querying trades.
+"""
+input TradeAssetInput {
+  assetType: String
+  assetCode: String
+  assetIssuer: String
 }
 
-"""Paginated asset stats results."""
-type AssetStatsPage {
-  data: [AssetStats!]!
-  cursor: String
-  hasMore: Boolean!
-}
-
-"""Field to sort assets by."""
-enum AssetSortField {
-  HOLDERS
-  VOLUME
-  ACTIVITY
-}
-
-"""Trustline change event (Issue #7)."""
-type TrustlineChange {
-  accountAddress: String!
-  assetCode: String!
-  assetIssuer: String!
-  operationId: String!
-  ledgerSequence: Int!
-  limitBefore: String
-  limitAfter: String!
-  changedAt: String!
-}
-
-"""Contract storage entry (Issue #9)."""
-type ContractStorageEntry {
-  contractId: String!
-  storageKey: JSON!
-  storageValue: JSON!
-  durability: StorageDurability!
-  lastChangedLedger: Int!
-}
-
-"""Paginated contract storage entries."""
-type ContractStorageEntryPage {
-  data: [ContractStorageEntry!]!
-  cursor: String
-  hasMore: Boolean!
-}
-
-"""Storage durability type."""
-enum StorageDurability {
-  TEMPORARY
-  PERSISTENT
-  INSTANCE
-}
-
-"""Export job (Issue #10)."""
-type ExportJob {
+"""
+An executed trade between two assets on the Stellar network.
+Populated from Horizon's /trades endpoint.
+"""
+type Trade {
   id: String!
-  status: ExportStatus!
-  format: ExportFormat!
-  outputLocation: String
-  rowCount: Int
-  errorMessage: String
-  createdAt: String!
-  completedAt: String
+  pagingToken: String!
+  ledgerCloseTime: String!
+  tradeType: String!
+  baseAccount: String!
+  baseAmount: String!
+  baseAssetType: String!
+  baseAssetCode: String
+  baseAssetIssuer: String
+  baseOfferId: String
+  counterAccount: String
+  counterAmount: String!
+  counterAssetType: String!
+  counterAssetCode: String
+  counterAssetIssuer: String
+  counterOfferId: String
+  baseIsSeller: Boolean
+  price: String
+  priceNumerator: String
+  priceDenominator: String
 }
 
-"""Export job status."""
-enum ExportStatus {
-  PENDING
-  RUNNING
-  COMPLETE
-  FAILED
+"""
+A page of trades, ordered by ledger close time descending.
+"""
+type TradePage {
+  items: [Trade!]!
+  pageInfo: PageInfo!
 }
 
-"""Export format."""
-enum ExportFormat {
-  CSV
-  PARQUET
-}
-
-"""API usage statistics (Issue #8)."""
-type UsageStats {
-  requests: Int!
-  avgResponseTime: Float!
-  rateLimit: Int
-  remainingQuota: Int
-}
-
-"""Request bulk data export (Issue #10)."""
-type Mutation {
-  requestExport(
-    network: Network
-    filter: ExportFilter!
-  ): ExportJob!
-}
-
-"""Export filter input."""
-input ExportFilter {
-  table: String!
-  fromLedger: Int
-  toLedger: Int
-  format: ExportFormat = CSV
-}

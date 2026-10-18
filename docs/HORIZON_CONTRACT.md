@@ -11,7 +11,7 @@ This document specifies the exact contract between Lumina's indexer and the Stel
   - Mainnet: `https://horizon.stellar.org`
   - Testnet: `https://horizon-testnet.stellar.org`
   - Futurenet: `https://horizon-futurenet.stellar.org`
-- **Paging Protocol**: Cursor-based using `_links.next.href` with page size limit of 200 records.
+- **Paging Protocol**: Cursor-based using `_links.next.href` or `paging_token` with page size limit of 200 records (`PAGE_LIMIT = 200`).
 
 ---
 
@@ -104,6 +104,33 @@ Queried during account worker refresh runs and stored in the `accounts` table.
 
 ---
 
+### 2.6 Trades Ingestion (`GET /trades?order=asc&limit=200&cursor=...`)
+
+Queried by the trades indexer loop (`pollTrades`) and stored in the `trades` table. Deriving trades from operations alone is unreliable because a single path payment or DEX offer operation can cross multiple order book offers and produce several trade records.
+
+| Horizon Field | JSON Type | DB Column (`trades`) | Required? | What Breaks Without It |
+|---|---|---|---|---|
+| `id` | `string` | `id` (`text`, PK component) | **Yes** | Primary key violation; deduplication (`ON CONFLICT (id, network) DO NOTHING`) fails. |
+| `paging_token` | `string` | `paging_token` (`text`, NOT NULL) | **Yes** | Loop cursor tracking halts; cannot advance forward in `/trades`. |
+| `ledger_close_time` | `string` (ISO-8601) | `ledger_close_time` (`timestamptz`, NOT NULL) | **Yes** | NOT NULL violation; chronological queries fail. |
+| `trade_type` | `string` | `trade_type` (`text`, DEFAULT 'orderbook') | No | Falls back to `'orderbook'`. |
+| `base_account` | `string` (G-address) | `base_account` (`text`, NOT NULL) | **Yes** | Account trades query (`trades(account:)`) fails to associate trade with base party. |
+| `base_amount` | `string` (decimal) | `base_amount` (`numeric(20,7)`, NOT NULL) | **Yes** | NOT NULL check fails; volume calculations break. |
+| `base_asset_type` | `string` | `base_asset_type` (`text`, NOT NULL) | **Yes** | Cannot determine whether asset is native or issued. |
+| `base_asset_code` | `string` | `base_asset_code` (`text`, nullable) | Conditional (issued asset) | Asset pair query (`trades(baseAsset:)`) fails to match issued tokens. |
+| `base_asset_issuer` | `string` | `base_asset_issuer` (`text`, nullable) | Conditional (issued asset) | Cannot distinguish identical token codes issued by different accounts. |
+| `base_offer_id` | `string` | `base_offer_id` (`text`, nullable) | No | Offer correlation omitted. |
+| `counter_account` | `string` (G-address) | `counter_account` (`text`, nullable) | Conditional | Account trades query (`trades(account:)`) fails to associate trade with counter party. |
+| `counter_amount` | `string` (decimal) | `counter_amount` (`numeric(20,7)`, NOT NULL) | **Yes** | NOT NULL check fails; trade execution price calculation breaks. |
+| `counter_asset_type` | `string` | `counter_asset_type` (`text`, NOT NULL) | **Yes** | Cannot determine whether counter asset is native or issued. |
+| `counter_asset_code` | `string` | `counter_asset_code` (`text`, nullable) | Conditional (issued asset) | Counter asset pair filtering fails. |
+| `counter_asset_issuer` | `string` | `counter_asset_issuer` (`text`, nullable) | Conditional (issued asset) | Counter token issuer verification fails. |
+| `counter_offer_id` | `string` | `counter_offer_id` (`text`, nullable) | No | Counter offer tracking omitted. |
+| `base_is_seller` | `boolean` | `base_is_seller` (`boolean`, nullable) | No | Maker/taker direction is unknown. |
+| `price.n`, `price.d` | `string` or `number` | `price_n`, `price_d`, `price` | No | Price fraction and decimal ratio cannot be recorded. |
+
+---
+
 ## 3. Contract Testing & Verification
 
 1. **Recorded Fixtures**:
@@ -111,15 +138,16 @@ Queried during account worker refresh runs and stored in the `accounts` table.
    - Recording procedures and fixture guidelines are documented in `docs/HORIZON_FIXTURES.md`.
 
 2. **Test Suites Enforcing Contract**:
-   - `shared/src/horizon.test.ts`: Verifies paging, retry logic, timeout handling, error isolation, and URL construction.
+   - `shared/src/horizon.test.ts`: Verifies paging, retry logic, timeout handling, error isolation, trade fetching, and URL construction.
    - `indexer/src/horizon.test.ts`: Verifies parsing of recorded fixtures against expected TypeScript interfaces.
-   - `graphql-server/src/horizon.test.ts`: Verifies GraphQL fallback behavior on Horizon outages and 404 handling.
+   - `graphql-server/src/horizon.test.ts`: Verifies GraphQL fallback behavior on Horizon outages, 404 handling, and fallback trades.
 
 3. **Updating the Contract on Horizon Upgrades**:
-   - Run the verification fixture script:
+   - Run verification queries against Horizon:
      ```bash
      curl "https://horizon.stellar.org/ledgers/50000000" | jq .
      curl "https://horizon.stellar.org/ledgers/50000000/transactions?limit=1" | jq .
      curl "https://horizon.stellar.org/ledgers/50000000/operations?limit=1" | jq .
+     curl "https://horizon.stellar.org/trades?limit=1" | jq .
      ```
    - If Horizon introduces new fields or deprecates existing ones, update `shared/src/horizon.ts`, update `docs/HORIZON_CONTRACT.md`, and update tests in `horizon.test.ts`.

@@ -1,9 +1,18 @@
+/**
+ * Keyset pagination for Lumina's GraphQL API.
+ *
+ * A well-formed cursor with no rows past it returns an empty page: that is how a
+ * client learns it has finished. A cursor that cannot be decoded is an error
+ * (`INVALID_CURSOR`) on every paginated query, because the alternative — an
+ * empty page that a client reads as "the end" — silently truncates a result set
+ * and looks like a bug in their code rather than in the request.
+ */
 import { GraphQLError } from 'graphql';
 
 /** Page size a query uses when the caller does not ask for one. */
 export const DEFAULT_PAGE_LIMIT = 20;
 
-/** Maximum allowed page size across all queries. */
+/** Maximum allowable page size across all paginated queries. */
 export const MAX_PAGE_SIZE = 100;
 
 export function getPageSize(limit: number | null | undefined, defaultLimit = DEFAULT_PAGE_LIMIT): number {
@@ -25,14 +34,13 @@ export function getPageSize(limit: number | null | undefined, defaultLimit = DEF
 /** The values a cursor may carry: a sort key is a number or a string. */
 export type CursorValue = number | string;
 
-/** Direction for cursor-based pagination (Issue #287). */
-export type PaginationDirection = 'FORWARD' | 'BACKWARD';
-
 /**
  * A cursor the server cannot use.
  *
  * A `GraphQLError` with a code rather than a plain `Error`, so the code reaches
- * the client instead of being flattened to `INTERNAL_SERVER_ERROR`.
+ * the client instead of being flattened to `INTERNAL_SERVER_ERROR` — this is a
+ * mistake in the request, and a client has to be able to tell that apart from a
+ * failure on the server side.
  */
 export class InvalidCursorError extends GraphQLError {
   constructor(detail: string) {
@@ -44,8 +52,29 @@ export class InvalidCursorError extends GraphQLError {
 }
 
 /**
+ * Precision level of a returned total count.
+ */
+export enum CountPrecision {
+  EXACT = 'EXACT',
+  ESTIMATE = 'ESTIMATE',
+}
+
+/**
+ * Returned total count with transparency on whether it is an exact count or an estimate.
+ */
+export interface TotalCount {
+  value: number;
+  precision: CountPrecision;
+  isEstimate: boolean;
+}
+
+/**
  * What a query keysets on: the ordering columns, their types, and the query they
  * belong to.
+ *
+ * Declared once per paginated query and used by both the SQL that reads the
+ * cursor and the resolver that mints it, so the two cannot disagree about what a
+ * cursor holds.
  */
 export interface Keyset {
   /** The paginated query these cursors belong to — see `decodeCursor`. */
@@ -61,7 +90,9 @@ export interface Keyset {
  *
  * Keyed by the GraphQL field name: a cursor names the query that issued it, so
  * handing a `transactions` cursor to `events` is rejected with an error saying
- * so rather than compared against the wrong columns.
+ * so rather than compared against the wrong columns — which, where two queries
+ * happen to have the same arity, would otherwise resume somewhere plausible and
+ * wrong.
  */
 export const KEYSETS = {
   transactions: { query: 'transactions', columns: ['ledger', 'hash'], types: ['bigint', 'text'] },
@@ -73,6 +104,7 @@ export const KEYSETS = {
   events: { query: 'events', columns: ['ledger', 'id'], types: ['bigint', 'text'] },
   customEvents: { query: 'customEvents', columns: ['ledger', 'event_id'], types: ['bigint', 'text'] },
   search: { query: 'search', columns: ['rank', 'ledger', 'hash'], types: ['real', 'bigint', 'text'] },
+  trades: { query: 'trades', columns: ['ledger_close_time', 'id'], types: ['timestamptz', 'text'] },
 } as const satisfies Record<string, Keyset>;
 
 /** The keyset for a paginated query, by its GraphQL field name. */
@@ -86,7 +118,8 @@ export function keysetFor(query: string): Keyset {
  * Encode a sort-key tuple, tagged with the query that issued it.
  *
  * base64url rather than a readable string so that a client which starts building
- * cursors by hand does not become a compatibility constraint.
+ * cursors by hand does not become a compatibility constraint on how a query
+ * orders its results.
  */
 export function encodeCursor(query: string, values: readonly CursorValue[]): string {
   return Buffer.from(JSON.stringify({ q: query, k: values }), 'utf-8').toString('base64url');
@@ -94,6 +127,10 @@ export function encodeCursor(query: string, values: readonly CursorValue[]): str
 
 /**
  * Decode a cursor into its sort-key tuple, or throw `InvalidCursorError`.
+ *
+ * `arity` is the keyset's width, and `query` the query it belongs to. Checking
+ * both is what makes "an invalid cursor" mean the same thing on every query
+ * rather than each one noticing a different kind of breakage.
  */
 export function decodeCursor(raw: string, query: string, arity: number): CursorValue[] {
   let parsed: unknown;
@@ -135,92 +172,65 @@ export function decodeCursor(raw: string, query: string, arity: number): CursorV
 
 export interface PageInfo {
   hasNextPage: boolean;
-  hasPreviousPage: boolean;
-  startCursor: string | null;
-  endCursor: string | null;
   cursor: string | null;
+  totalCount?: TotalCount | null;
 }
 
 /**
- * The `pageInfo` for one page of results supporting bidirectional pagination.
+ * The `pageInfo` for one page of results.
  *
- * Provides both `startCursor` and `endCursor`, so a client can page forwards
- * using `endCursor` or backwards using `startCursor`.
+ * `hasNextPage` is "a full page came back", which costs nothing extra and is
+ * what every other paginated query has always reported. The cursor is the last
+ * row's sort key whenever there is one, including on a short final page: a client
+ * that stops because `hasNextPage` is false has nothing to do with it, and a
+ * client that pages anyway gets the empty page that means it is done.
+ *
+ * `keyOf` returns the columns the query keysets on, in the same order — one
+ * value for a single-column ordering, a tuple for a composite one.
  */
 export function pageInfo<T>(
   keyset: Keyset,
   items: readonly T[],
   limit: number,
   keyOf: (item: T) => CursorValue | readonly CursorValue[],
-  direction: PaginationDirection = 'FORWARD',
-  hasPrior = false
+  totalCount?: TotalCount | null
 ): PageInfo {
-  const first = items.at(0);
   const last = items.at(-1);
-
-  if (first === undefined || last === undefined) {
-    return {
-      hasNextPage: false,
-      hasPreviousPage: hasPrior,
-      startCursor: null,
-      endCursor: null,
-      cursor: null,
-    };
-  }
-
-  const firstKey = keyOf(first);
-  const firstValues = typeof firstKey === 'string' || typeof firstKey === 'number' ? [firstKey] : [...firstKey];
-  const lastKey = keyOf(last);
-  const lastValues = typeof lastKey === 'string' || typeof lastKey === 'number' ? [lastKey] : [...lastKey];
-
-  if (firstValues.length !== keyset.columns.length || lastValues.length !== keyset.columns.length) {
+  if (last === undefined) return { hasNextPage: false, cursor: null, totalCount: totalCount ?? null };
+  const key = keyOf(last);
+  const values = typeof key === 'string' || typeof key === 'number' ? [key] : [...key];
+  if (values.length !== keyset.columns.length) {
+    // A resolver minting the wrong number of values would issue cursors its own
+    // query rejects; failing here names the mistake at its source.
     throw new Error(
-      `${keyset.query}: cursor values count does not match keyset columns count (${keyset.columns.length}).`
+      `${keyset.query}: cursor has ${values.length} sort keys but its keyset has ${keyset.columns.length}.`
     );
   }
-
-  const startCursor = encodeCursor(keyset.query, firstValues);
-  const endCursor = encodeCursor(keyset.query, lastValues);
-
-  const isFullPage = items.length === limit;
-  const hasNextPage = direction === 'FORWARD' ? isFullPage : hasPrior;
-  const hasPreviousPage = direction === 'FORWARD' ? hasPrior : isFullPage;
-
   return {
-    hasNextPage,
-    hasPreviousPage,
-    startCursor,
-    endCursor,
-    cursor: endCursor,
+    hasNextPage: items.length === limit,
+    cursor: encodeCursor(keyset.query, values),
+    totalCount: totalCount ?? null,
   };
 }
 
 /**
  * Bind a keyset to a parameter list and return the SQL row comparison that
- * resumes strictly before or after it, depending on pagination direction.
+ * resumes strictly after it, or `null` when there is no cursor.
  *
- * For descending ordering (default in ledger/transaction feeds):
- * - FORWARD uses `<` (older ledgers/rows)
- * - BACKWARD uses `>` (newer ledgers/rows)
- *
- * For ascending ordering:
- * - FORWARD uses `>`
- * - BACKWARD uses `<`
+ * Each value is cast to the type of the column it is compared with: a bound
+ * parameter is untyped, so comparing a `bigint` column to an uncast text
+ * parameter makes Postgres sort the key as a string, where "9" is greater than
+ * "10".
  */
 export function cursorCondition(
   params: unknown[],
   keyset: Keyset,
-  cursor?: string | null,
-  direction: PaginationDirection = 'FORWARD',
-  order: 'ASC' | 'DESC' = 'DESC'
+  cursor?: string | null
 ): string | null {
   if (!cursor) return null;
   const values = decodeCursor(cursor, keyset.query, keyset.columns.length);
   const first = params.length + 1;
   const bound = keyset.columns.map((_, index) => `$${first + index}::${keyset.types[index]}`);
   params.push(...values);
-
-  const isForward = direction === 'FORWARD';
-  const operator = order === 'DESC' ? (isForward ? '<' : '>') : (isForward ? '>' : '<');
-  return `(${keyset.columns.join(', ')}) ${operator} (${bound.join(', ')})`;
+  return `(${keyset.columns.join(', ')}) < (${bound.join(', ')})`;
 }
