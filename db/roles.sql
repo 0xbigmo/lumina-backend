@@ -188,10 +188,11 @@ BEGIN
       ('contract_schemas', 'INSERT'),
       ('contract_schemas', 'UPDATE'),
       ('contract_schemas', 'DELETE'),
-      -- Backfill progress tracking
-      ('backfill_progress', 'SELECT'),
-      ('backfill_progress', 'INSERT'),
-      ('backfill_progress', 'UPDATE')
+      -- Failed ledgers recorded upon retry exhaustion, queried for gaps, cleared on index
+      ('failed_ledgers',   'SELECT'),
+      ('failed_ledgers',   'INSERT'),
+      ('failed_ledgers',   'UPDATE'),
+      ('failed_ledgers',   'DELETE')
     ) AS grants(tbl, priv)
   LOOP
     -- Tolerate schema versions where a table does not exist yet.
